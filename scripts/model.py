@@ -24,6 +24,7 @@ class MaterialPredictionModel:
         self.classification_results = None
         self.regression_results = None
         self.repair_time_results = None
+        self.repair_time_features = None  # Store feature names used in training
         self.models_dir = "models/saved_models"
         self.problem_categories = {}
         self.material_recommendations = {}
@@ -73,7 +74,8 @@ class MaterialPredictionModel:
             tfidf_matrix = vectorizer.fit_transform(problem_desc)
             
             # Use KMeans to cluster similar problems
-            kmeans = KMeans(n_clusters=min(20, len(df)//10), random_state=42)
+            n_clusters = min(20, max(2, len(df)//10))
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             clusters = kmeans.fit_predict(tfidf_matrix)
             
             # Create problem categories
@@ -117,6 +119,14 @@ class MaterialPredictionModel:
             X_text = df['ProblemDesc_Clean'].fillna('')
             y = df['MatName']
             
+            # Remove empty or invalid entries
+            valid_mask = (X_text != '') & (y != '') & (~y.isna())
+            X_text = X_text[valid_mask]
+            y = y[valid_mask]
+            
+            if len(X_text) == 0:
+                return {'error': 'No valid training data found'}
+            
             # Filter out classes with very few samples
             class_counts = y.value_counts()
             valid_classes = class_counts[class_counts >= 2].index
@@ -125,6 +135,9 @@ class MaterialPredictionModel:
             valid_mask = y.isin(valid_classes)
             X_text = X_text[valid_mask]
             y = y[valid_mask]
+            
+            if len(X_text) == 0:
+                return {'error': 'No valid classes with sufficient samples'}
             
             # TF-IDF Vectorization
             self.tfidf_vectorizer = TfidfVectorizer(
@@ -141,7 +154,8 @@ class MaterialPredictionModel:
             
             # Train-test split
             X_train, X_test, y_train, y_test = train_test_split(
-                X_tfidf, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+                X_tfidf, y_encoded, test_size=0.2, random_state=42, 
+                stratify=y_encoded if len(np.unique(y_encoded)) > 1 else None
             )
             
             # Train model
@@ -158,7 +172,7 @@ class MaterialPredictionModel:
             accuracy = accuracy_score(y_test, y_pred)
             
             # Cross-validation
-            cv_scores = cross_val_score(self.material_classifier, X_tfidf, y_encoded, cv=5)
+            cv_scores = cross_val_score(self.material_classifier, X_tfidf, y_encoded, cv=min(5, len(np.unique(y_encoded))))
             
             # Classification report with proper labels
             unique_labels = np.unique(y_test)
@@ -196,6 +210,14 @@ class MaterialPredictionModel:
             X = features_df
             y = df['QtyOut']
             
+            # Remove NaN values
+            valid_mask = ~(X.isna().any(axis=1) | y.isna())
+            X = X[valid_mask]
+            y = y[valid_mask]
+            
+            if len(X) == 0:
+                return {'error': 'No valid data for regression'}
+            
             # Remove outliers
             Q1 = y.quantile(0.25)
             Q3 = y.quantile(0.75)
@@ -206,6 +228,9 @@ class MaterialPredictionModel:
             mask = (y >= lower_bound) & (y <= upper_bound)
             X = X[mask]
             y = y[mask]
+            
+            if len(X) == 0:
+                return {'error': 'No data remaining after outlier removal'}
             
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=42
@@ -264,65 +289,130 @@ class MaterialPredictionModel:
             
             # Create repair time features
             df_repair = df.copy()
-            df_repair['TransOutDate'] = pd.to_datetime(df_repair['TransOutDate'])
+            df_repair['TransOutDate'] = pd.to_datetime(df_repair['TransOutDate'], errors='coerce')
             
-            # Sort by WorkOrderNo and TransOutDate to calculate repair cycles
-            df_repair = df_repair.sort_values(['WorkOrderNo', 'TransOutDate'])
+            # Remove rows with invalid dates
+            df_repair = df_repair.dropna(subset=['TransOutDate'])
             
-            # Calculate days between repairs for same work order
-            df_repair['Days_Since_Last_Repair'] = df_repair.groupby('WorkOrderNo')['TransOutDate'].diff().dt.days
+            if len(df_repair) == 0:
+                return {'error': 'No valid dates found'}
             
-            # Fill NaN values with median
-            df_repair['Days_Since_Last_Repair'] = df_repair['Days_Since_Last_Repair'].fillna(
-                df_repair['Days_Since_Last_Repair'].median()
-            )
+            # Group by WorkOrderNo and calculate repair intervals
+            repair_intervals = []
             
-            # Prepare features for repair time prediction
-            features_df = self.prepare_features(df_repair)
-            
-            if not features_df.empty:
-                X = features_df
-                y = df_repair['Days_Since_Last_Repair']
+            for work_order in df_repair['WorkOrderNo'].unique():
+                wo_data = df_repair[df_repair['WorkOrderNo'] == work_order].sort_values('TransOutDate')
                 
-                # Remove outliers
-                Q1 = y.quantile(0.25)
-                Q3 = y.quantile(0.75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-                
-                mask = (y >= lower_bound) & (y <= upper_bound)
-                X = X[mask]
-                y = y[mask]
-                
+                if len(wo_data) > 1:
+                    # Calculate intervals between consecutive repairs
+                    for i in range(1, len(wo_data)):
+                        days_between = (wo_data.iloc[i]['TransOutDate'] - wo_data.iloc[i-1]['TransOutDate']).days
+                        
+                        if days_between > 0 and days_between <= 365:  # Valid interval
+                            repair_intervals.append({
+                                'WorkOrderNo': work_order,
+                                'Days_Since_Last_Repair': days_between,
+                                'ProblemDesc_Length': len(str(wo_data.iloc[i]['ProblemDesc'])),
+                                'ProblemDesc_WordCount': len(str(wo_data.iloc[i]['ProblemDesc']).split()),
+                                'MachineType': wo_data.iloc[i]['MachineType'] if 'MachineType' in wo_data.columns else 'UNKNOWN',
+                                'Price': wo_data.iloc[i]['Price'] if 'Price' in wo_data.columns else 0,
+                                'QtyOut': wo_data.iloc[i]['QtyOut'] if 'QtyOut' in wo_data.columns else 1
+                            })
+                else:
+                    # Single repair record - use average interval
+                    repair_intervals.append({
+                        'WorkOrderNo': work_order,
+                        'Days_Since_Last_Repair': 60,  # Default 60 days
+                        'ProblemDesc_Length': len(str(wo_data.iloc[0]['ProblemDesc'])),
+                        'ProblemDesc_WordCount': len(str(wo_data.iloc[0]['ProblemDesc']).split()),
+                        'MachineType': wo_data.iloc[0]['MachineType'] if 'MachineType' in wo_data.columns else 'UNKNOWN',
+                        'Price': wo_data.iloc[0]['Price'] if 'Price' in wo_data.columns else 0,
+                        'QtyOut': wo_data.iloc[0]['QtyOut'] if 'QtyOut' in wo_data.columns else 1
+                    })
+            
+            if not repair_intervals:
+                return {'error': 'No repair intervals could be calculated'}
+            
+            # Convert to DataFrame
+            repair_df = pd.DataFrame(repair_intervals)
+            
+            # Prepare features
+            features = ['ProblemDesc_Length', 'ProblemDesc_WordCount']
+            
+            # Add machine type encoding
+            if 'MachineType' in repair_df.columns:
+                repair_df['MachineType_Encoded'] = pd.Categorical(repair_df['MachineType']).codes
+                features.append('MachineType_Encoded')
+            
+            # Add price log
+            if 'Price' in repair_df.columns:
+                repair_df['Price_Log'] = np.log1p(repair_df['Price'])
+                features.append('Price_Log')
+            
+            # Add quantity
+            if 'QtyOut' in repair_df.columns:
+                features.append('QtyOut')
+            
+            # Store the feature names used in training
+            self.repair_time_features = features
+            
+            X = repair_df[features]
+            y = repair_df['Days_Since_Last_Repair']
+            
+            # Remove NaN values
+            valid_mask = ~(X.isna().any(axis=1) | y.isna())
+            X = X[valid_mask]
+            y = y[valid_mask]
+            
+            if len(X) == 0:
+                return {'error': 'No valid data for repair time prediction'}
+            
+            # Remove outliers
+            Q1 = y.quantile(0.25)
+            Q3 = y.quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = max(1, Q1 - 1.5 * IQR)  # Minimum 1 day
+            upper_bound = min(365, Q3 + 1.5 * IQR)  # Maximum 365 days
+            
+            mask = (y >= lower_bound) & (y <= upper_bound)
+            X = X[mask]
+            y = y[mask]
+            
+            if len(X) == 0:
+                return {'error': 'No data remaining after outlier removal'}
+            
+            # Train-test split
+            if len(X) < 10:
+                # Use all data for training if too few samples
+                X_train, X_test, y_train, y_test = X, X, y, y
+            else:
                 X_train, X_test, y_train, y_test = train_test_split(
                     X, y, test_size=0.2, random_state=42
                 )
-                
-                # Train repair time predictor
-                self.repair_time_predictor = RandomForestRegressor(
-                    n_estimators=100, 
-                    random_state=42,
-                    min_samples_split=5,
-                    min_samples_leaf=2
-                )
-                self.repair_time_predictor.fit(X_train, y_train)
-                
-                # Evaluate
-                y_pred = self.repair_time_predictor.predict(X_test)
-                r2 = r2_score(y_test, y_pred)
-                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-                
-                self.repair_time_results = {
-                    'r2_score': r2,
-                    'rmse': rmse,
-                    'mean_repair_time': y.mean(),
-                    'median_repair_time': y.median()
-                }
-                
-                return self.repair_time_results
-            else:
-                return {'error': 'No suitable features for repair time prediction'}
+            
+            # Train repair time predictor
+            self.repair_time_predictor = RandomForestRegressor(
+                n_estimators=100, 
+                random_state=42,
+                min_samples_split=max(2, len(X_train)//10),
+                min_samples_leaf=1
+            )
+            self.repair_time_predictor.fit(X_train, y_train)
+            
+            # Evaluate
+            y_pred = self.repair_time_predictor.predict(X_test)
+            r2 = r2_score(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            
+            self.repair_time_results = {
+                'r2_score': r2,
+                'rmse': rmse,
+                'mean_repair_time': y.mean(),
+                'median_repair_time': y.median(),
+                'feature_names': features
+            }
+            
+            return self.repair_time_results
                 
         except Exception as e:
             return {'error': str(e)}
@@ -365,37 +455,101 @@ class MaterialPredictionModel:
         except Exception as e:
             return f"Error making prediction: {str(e)}"
     
-    def predict_repair_time(self, work_order_no, last_repair_date=None):
-        """Predict next repair time"""
+    def predict_material(self, problem_description):
+        """Predict material based on problem description"""
+        try:
+            if self.material_classifier is None or self.tfidf_vectorizer is None:
+                return "Model not trained. Please train the classification model first."
+            
+            if self.label_encoder is None:
+                return "Label encoder not available. Please train the classification model first."
+            
+            # Clean and vectorize the problem description
+            problem_clean = str(problem_description).upper()
+            X_tfidf = self.tfidf_vectorizer.transform([problem_clean])
+            
+            # Make prediction
+            prediction_encoded = self.material_classifier.predict(X_tfidf)[0]
+            probabilities = self.material_classifier.predict_proba(X_tfidf)[0]
+            
+            # Get material name and confidence
+            material_name = self.label_encoder.inverse_transform([prediction_encoded])[0]
+            confidence = probabilities[prediction_encoded]
+            
+            return {
+                'material': material_name,
+                'confidence': confidence
+            }
+            
+        except Exception as e:
+            return f"Error making prediction: {str(e)}"
+    
+    def predict_repair_time(self, df, work_order_no, last_repair_date=None):
+        """Predict next repair time using actual work order data"""
         try:
             if self.repair_time_predictor is None:
                 return "Repair time model not trained."
             
-            # Default features (can be enhanced with actual work order data)
+            # Use the stored feature names from training
+            if self.repair_time_features is None:
+                return "Feature information not available. Please retrain the model."
+            
+            # Get actual data for the specific work order
+            wo_data = df[df['WorkOrderNo'] == work_order_no]
+            
+            if wo_data.empty:
+                return f"Work order {work_order_no} not found in data."
+            
+            # Get the most recent record for this work order
+            latest_record = wo_data.iloc[-1]
+            
+            # Extract actual features from the work order data
+            problem_desc = str(latest_record.get('ProblemDesc', ''))
+            
+            feature_data = {
+                'ProblemDesc_Length': len(problem_desc),
+                'ProblemDesc_WordCount': len(problem_desc.split()) if problem_desc else 0,
+                'MachineType_Encoded': latest_record.get('MachineType_Encoded', 0),
+                'Price_Log': np.log1p(latest_record.get('Price', 50)),
+                'QtyOut': latest_record.get('QtyOut', 1)
+            }
+            
+            # Create DataFrame with only the features used in training
             features = pd.DataFrame({
-                'ProblemDesc_Length': [25],
-                'ProblemDesc_WordCount': [5],
-                'MachineType_Encoded': [0],
-                'Price_Log': [1.0]
+                feature: [feature_data.get(feature, 0)] 
+                for feature in self.repair_time_features
             })
             
+            # Make prediction
             predicted_days = self.repair_time_predictor.predict(features)[0]
             
+            # Ensure prediction is within reasonable bounds
+            predicted_days = max(7, min(365, predicted_days))
+            
+            # Calculate next repair date
             if last_repair_date:
-                last_date = pd.to_datetime(last_repair_date)
-                next_repair_date = last_date + timedelta(days=int(predicted_days))
+                try:
+                    if isinstance(last_repair_date, str):
+                        last_date = pd.to_datetime(last_repair_date)
+                    else:
+                        last_date = pd.to_datetime(last_repair_date)
+                    next_repair_date = last_date + timedelta(days=int(predicted_days))
+                except:
+                    next_repair_date = datetime.now() + timedelta(days=int(predicted_days))
             else:
                 next_repair_date = datetime.now() + timedelta(days=int(predicted_days))
+            
+            days_from_now = (next_repair_date - datetime.now()).days
             
             return {
                 'predicted_days': int(predicted_days),
                 'next_repair_date': next_repair_date.strftime('%Y-%m-%d'),
-                'days_from_now': (next_repair_date - datetime.now()).days
+                'days_from_now': days_from_now
             }
             
         except Exception as e:
             return f"Error predicting repair time: {str(e)}"
-    
+
     def generate_repair_schedule(self, df, days_ahead=90):
         """Generate repair schedule table"""
         try:
@@ -411,16 +565,26 @@ class MaterialPredictionModel:
             for wo in work_orders:
                 wo_data = df[df['WorkOrderNo'] == wo]
                 if len(wo_data) > 0:
-                    last_repair = wo_data['TransOutDate'].max()
+                    # Get last repair date
+                    try:
+                        wo_dates = pd.to_datetime(wo_data['TransOutDate'], errors='coerce')
+                        valid_dates = wo_dates.dropna()
+                        
+                        if len(valid_dates) > 0:
+                            last_repair = valid_dates.max()
+                        else:
+                            continue
+                    except:
+                        continue
                     
-                    # Predict next repair
-                    prediction = self.predict_repair_time(wo, last_repair)
+                    # Predict next repair using actual data
+                    prediction = self.predict_repair_time(df, wo, last_repair)
                     
                     if isinstance(prediction, dict):
                         days_from_now = prediction['days_from_now']
                         
                         if days_from_now <= days_ahead:
-                            # Determine priority color
+                            # Determine priority
                             if days_from_now <= 7:
                                 priority = 'High'
                                 color = 'red'
@@ -431,6 +595,10 @@ class MaterialPredictionModel:
                                 priority = 'Low'
                                 color = 'green'
                             
+                            # Get problem description
+                            problem_desc = str(wo_data['ProblemDesc'].iloc[0])
+                            problem_type = problem_desc[:50] + '...' if len(problem_desc) > 50 else problem_desc
+                            
                             schedule_data.append({
                                 'WorkOrderNo': wo,
                                 'LastRepairDate': last_repair.strftime('%Y-%m-%d'),
@@ -438,7 +606,7 @@ class MaterialPredictionModel:
                                 'DaysFromNow': days_from_now,
                                 'Priority': priority,
                                 'Color': color,
-                                'ProblemType': wo_data['ProblemDesc'].iloc[0][:50] + '...'
+                                'ProblemType': problem_type
                             })
             
             # Sort by days from now
@@ -468,10 +636,26 @@ class MaterialPredictionModel:
                 if model is not None:
                     joblib.dump(model, os.path.join(self.models_dir, f'{model_name}.pkl'))
             
+            # Save repair time features
+            if self.repair_time_features is not None:
+                joblib.dump(self.repair_time_features, 
+                           os.path.join(self.models_dir, 'repair_time_features.pkl'))
+            
             # Save problem categories
             if self.problem_categories:
                 joblib.dump(self.problem_categories, 
                            os.path.join(self.models_dir, 'problem_categories.pkl'))
+            
+            # Save results
+            results_to_save = {
+                'classification_results': self.classification_results,
+                'regression_results': self.regression_results,
+                'repair_time_results': self.repair_time_results
+            }
+            
+            for result_name, result in results_to_save.items():
+                if result is not None:
+                    joblib.dump(result, os.path.join(self.models_dir, f'{result_name}.pkl'))
             
             return True
             
@@ -495,10 +679,27 @@ class MaterialPredictionModel:
                 if os.path.exists(filepath):
                     setattr(self, attr_name, joblib.load(filepath))
             
+            # Load repair time features
+            features_path = os.path.join(self.models_dir, 'repair_time_features.pkl')
+            if os.path.exists(features_path):
+                self.repair_time_features = joblib.load(features_path)
+            
             # Load problem categories
             categories_path = os.path.join(self.models_dir, 'problem_categories.pkl')
             if os.path.exists(categories_path):
                 self.problem_categories = joblib.load(categories_path)
+            
+            # Load results
+            result_files = {
+                'classification_results': 'classification_results.pkl',
+                'regression_results': 'regression_results.pkl',
+                'repair_time_results': 'repair_time_results.pkl'
+            }
+            
+            for attr_name, filename in result_files.items():
+                filepath = os.path.join(self.models_dir, filename)
+                if os.path.exists(filepath):
+                    setattr(self, attr_name, joblib.load(filepath))
             
             return True
             

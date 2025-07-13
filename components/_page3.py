@@ -96,7 +96,7 @@ def show_page():
                     y=results['test_predictions']['rf_predicted'],
                     mode='markers',
                     name='RF Predictions',
-                    marker=dict(color='blue', alpha=0.6)
+                    marker=dict(color='blue', opacity=0.6)
                 ),
                 row=1, col=1
             )
@@ -107,7 +107,7 @@ def show_page():
                     y=results['test_predictions']['lr_predicted'],
                     mode='markers',
                     name='LR Predictions',
-                    marker=dict(color='red', alpha=0.6)
+                    marker=dict(color='red', opacity=0.6)
                 ),
                 row=1, col=2
             )
@@ -429,7 +429,7 @@ def show_page():
             if selected_wo:
                 with st.spinner("Predicting repair time..."):
                     prediction = st.session_state.enhanced_model.predict_repair_time(
-                        selected_wo, last_repair_date
+                        df, selected_wo, last_repair_date
                     )
                     
                     if isinstance(prediction, dict):
