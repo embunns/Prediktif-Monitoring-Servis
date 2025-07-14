@@ -62,7 +62,6 @@ def plot_material_frequency(df):
         height=800,
         showlegend=True,
         title_text="Material Analysis Dashboard",
-        title_x=0.5
     )
     
     fig.update_xaxes(tickangle=45, row=1, col=1)
@@ -75,6 +74,7 @@ def plot_time_series_analysis(df):
     
     fig = make_subplots(
         rows=2, cols=2,
+        
         subplot_titles=('Monthly Usage Trend', 'Quarterly Distribution', 
                        'Usage by Machine Type Over Time', 'Seasonal Patterns'),
         specs=[[{"colspan": 2}, None],
